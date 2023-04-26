@@ -120,9 +120,6 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 	// schedulded node of the pod is the first entry in the preferred segment
 	node := req.GetAccessibilityRequirements().GetPreferred()[0].GetSegments()[topologyKeyNode]
-	topology := []*csi.Topology{{
-		Segments: map[string]string{topologyKeyNode: node},
-	}}
 	klog.Infof("creating volume %s on node: %s", req.GetName(), node)
 
 	va := volumeAction{
@@ -145,11 +142,10 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
-			VolumeId:           req.GetName(),
-			CapacityBytes:      req.GetCapacityRange().GetRequiredBytes(),
-			VolumeContext:      volumeContext,
-			ContentSource:      req.GetVolumeContentSource(),
-			AccessibleTopology: topology,
+			VolumeId:      req.GetName(),
+			CapacityBytes: req.GetCapacityRange().GetRequiredBytes(),
+			VolumeContext: volumeContext,
+			ContentSource: req.GetVolumeContentSource(),
 		},
 	}, nil
 }
@@ -172,31 +168,38 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		panic(err.Error())
 	}
 	klog.V(4).Infof("volume %s to be deleted", volume)
-	ns := volume.Spec.NodeAffinity.Required.NodeSelectorTerms
-	node := ns[0].MatchExpressions[0].Values[0]
-
-	klog.V(4).Infof("from node %s ", node)
-
-	_, err = cs.kubeClient.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
-	if err != nil {
-		if k8serror.IsNotFound(err) {
-			klog.Infof("node %s not found anymore. Assuming volume %s is gone for good.", node, volID)
-			return &csi.DeleteVolumeResponse{}, nil
-		} else {
-			klog.Errorf("error getting nodes: %v", err)
-			return nil, err
+	node := ""
+	if na := volume.Spec.NodeAffinity; na != nil {
+		if required := na.Required; required != nil {
+			ns := required.NodeSelectorTerms
+			if len(ns) > 0 && len(ns[0].MatchExpressions) > 0 && len(ns[0].MatchExpressions[0].Values[0]) > 0 {
+				node = ns[0].MatchExpressions[0].Values[0]
+				klog.V(4).Infof("from node %s ", node)
+				_, err = cs.kubeClient.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
+				if err != nil {
+					if k8serror.IsNotFound(err) {
+						klog.Infof("node %s not found anymore. Assuming volume %s is gone for good.", node, volID)
+						return &csi.DeleteVolumeResponse{}, nil
+					} else {
+						klog.Errorf("error getting nodes: %v", err)
+						return nil, err
+					}
+				}
+			}
 		}
 	}
 
 	va := volumeAction{
 		action:           actionTypeDelete,
 		name:             req.GetVolumeId(),
-		nodeName:         node,
 		pullPolicy:       cs.pullPolicy,
 		provisionerImage: cs.provisionerImage,
 		kubeClient:       cs.kubeClient,
 		namespace:        cs.namespace,
 		vgName:           cs.vgName,
+	}
+	if node != "" {
+		va.nodeName = node
 	}
 	if err := createProvisionerPod(ctx, va); err != nil {
 		klog.Errorf("error creating provisioner pod :%v", err)
